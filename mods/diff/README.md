@@ -3,7 +3,12 @@
 The diff pane as a plugin: `/diff` opens the session's uncommitted changes
 beside the transcript, one row per changed file and every file's hunks
 beneath, and closes it again; each toggle leaves `Diff panel shown` or
-`Diff panel hidden` in the transcript. The header, the file list and its
+`Diff panel hidden` in the transcript. Docked in a terminal, the header says
+`/diff to close` when it has room and the prompt has the keyboard. From the
+first docked open to the end of the session, `/diff` runs at once even while
+Claude is working, and the transcript line follows when the turn ends;
+without the fullscreen layout `/diff` waits for the turn to end. The header,
+the file list and its
 toggles stay put while the wheel moves the hunks under them three rows a
 tick, or the list a file a tick while the wheel is over a list longer than
 its eight rows (the plugin answers the pane's `ui.scroll` itself); a row's
@@ -29,7 +34,8 @@ the person has not opened or closed the pane in the meantime, so it never
 lands on an empty state such as `No changes this session` or
 `Diff unavailable`. If it does not open, it asks again when that fetch ends
 if an edit or shell command landed during it, and otherwise at the next edit
-or shell command that lands. An open the engine leaves waiting undrawn is
+or shell command that lands. Either ask holds during the wait after a slow
+fetch, described below. An open the engine leaves waiting undrawn is
 withdrawn, so no later resize seats it, and the next edit or shell command
 that lands asks again. An open answered `no-surface` (nothing is attached
 that draws it yet, as before a host's page attaches) is kept instead:
@@ -60,11 +66,15 @@ plainly, or against the merge-base with
 the default branch; the base line under the header names a base other than
 the session's, and the choice is kept per repository in the plugin's store.
 A picker shows one earlier turn's edits instead of the working tree, read
-from the session's messages. Files that changed before the session started
+from the session's messages. It lists 63 turns at most, in pages: its label
+counts them, and the turn at an end of the list says so when picking it moves
+the list on.
+Files that changed before the session started
 (by their timestamp, among the paths already dirty when the pane first
 read the repository), and noise (lockfiles, generated and test files), are
 listed apart and folded until asked for; a rename lists as git prints it.
-Outside a git repository `/diff` says so and does nothing else.
+Outside a git repository `/diff` says so and opens nothing; it still closes
+a pane that is open.
 
 Git runs when the built-in panel's would: nothing at the session's start;
 one `git rev-parse`, in the directory the session started in, when `/diff`
@@ -75,8 +85,28 @@ edit that landed or a shell command that ran, or by the fetch before a pane
 opens. Two reads have no counterpart in the built-in: a `git status` at a
 pane's first fetch, which stands in for the change time the built-in dates a
 moved file by, and the fetches an open nobody asked for repeats after its
-first fetch did not open the pane: one after each later edit or shell
-command that lands, and one more when one landed during a fetch.
+first fetch did not open the pane: one after a later edit or shell command
+that lands (several during a wait count as one), and one more when one
+landed during a fetch.
+
+In a repository with commits, a fetch usually reads the whole tree twice:
+one `git diff --numstat`, whose rows also give the totals, and one
+`git ls-files` for untracked files. The built-in runs `--shortstat` first;
+this pane runs it only after a listing too long for the host to return
+whole. Later fetches of that base then run `--shortstat` first and list only
+when it counts 500 changed files or fewer. The hunks of the files shown
+usually take one more `git diff`, limited to their paths.
+
+Unlike the built-in, the pane waits after a slow fetch. When a fetch's reads,
+not counting the hunks, took longer than 150 ms (the delay that already groups
+refreshes), the next fetch caused by an edit, a command or a moved HEAD waits
+that long once the fetch ends, at most 30 seconds. After a fetch that read
+nothing because git timed out, it waits at least 10 seconds, doubling with
+each timeout in a row up to a minute. Changes that arrive during the wait are
+read when it ends, so an open pane still ends on the latest state. Opening the
+pane, `/diff`, switching the base, `/clear` and `/resume` skip this wait, but
+still queue behind a fetch already running. An open nobody asked for skips it
+only on its first ask: later asks hold until the wait ends, and then one runs.
 
 `hooks/register.ts` is the module; everything under `hooks/` is its parts.
 
@@ -87,7 +117,7 @@ command that lands, and one more when one landed during a fetch.
 | `session.start` | Binds the engine once and registers `/diff` (a session where another `/diff` is listed leaves the plugin idle); asks nothing of the repository, which `/diff` or the first edit pins when it comes; off its dispatch, reads the transcript, and for a resumed session whose turns edited opens the pane as the first edit would. |
 | `ui.render` of `PromptHint` | Reads the terminal's width and whether its layout docks a pane, which decide whether the first edit opens the pane. |
 | `ui.render` of `Pane` | Draws the pane: docked, the header, base line, source picker, file list and toggles over the window of hunks; inline, the dialog. |
-| `command.run` of `diff` | Pins the repository when none is, opens or closes the pane (focused and closing on Escape without the fullscreen layout), says which, and remembers the choice. |
+| `command.run` of `diff` | Pins the repository when none is and the pane is closed, opens or closes the pane (focused and closing on Escape without the fullscreen layout), says which, and remembers the choice; a run that starts before the last one has finished does nothing. |
 | `ui.close` of the pane | Backs out of the dialog's detail view instead of closing; else remembers the person's close as `/diff`'s. |
 | `ui.scroll` of the pane | Docked, moves the hunks under the pinned header and list (three rows a wheel tick, a page a page key), or the list when the wheel is over it, and keeps the engine's window still. |
 | `ui.focus` in the pane | In the dialog's list, selects the file the ring lands on, re-centres the five rows on it, and lands the ring where that row now sits. |

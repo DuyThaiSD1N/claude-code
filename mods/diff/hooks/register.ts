@@ -9,7 +9,7 @@ import type {
 
 import Ask from './ask'
 import Backend from './backend'
-import { COMMAND_SPEC } from './command-spec'
+import { COMMAND_SPEC, DOCKED_COMMAND_SPEC } from './command-spec'
 import { drawnFilesOf } from './drawn-files-of'
 import { entryKindsOf } from './entry-kinds-of'
 import type Git from './git'
@@ -25,6 +25,7 @@ import OpenOutcome from './open-outcome'
 import PaneState from './pane-state'
 import PaneToggle from './pane-toggle'
 import Record from './record'
+import { refreshRestOf } from './refresh-rest-of'
 import Tools from './tools'
 import Turns from './turns'
 import Views from './views'
@@ -35,7 +36,8 @@ import Views from './views'
  *
  * Git runs when the built-in's would: none at the start; `/diff` or the main
  * loop's first checkpointed edit with room pins the backend, until `/clear`,
- * which reads afresh under a pane it leaves open.
+ * which reads afresh under a pane it leaves open. Reads an edit or command
+ * causes then wait after a slow one (refreshRestOf).
  *
  * @param on the engine's registrar
  */
@@ -49,7 +51,9 @@ export function register(on: On) {
   let dialogRows: number | null = null
   let hasAutoOpened = false
   let isAutoOpenPending = false
+  let isOpenAskKept = false
   let personCloses = 0
+  let isToggling = false
   let hasRestoredEdits = false
   let columns: number | null = null
   let shownSessionId: string | null = null
@@ -57,6 +61,9 @@ export function register(on: On) {
   let carrying: Ask.ArmedAsk | null = null
   let isRefreshing = false
   let isRefreshQueued = false
+  let isQueuedAsked = false
+  let timedOutRefreshes = 0
+  let restDueMs: number | null = null
   let reading: Promise<void> = Promise.resolve()
   let generation = 0
   let landed = 0
@@ -70,7 +77,7 @@ export function register(on: On) {
 
   let model: PaneState.PaneModel = PaneState.INITIAL_MODEL
 
-  const timers = new Map<'refresh' | 'redraw' | 'poll', Timer>()
+  const timers = new Map<'refresh' | 'redraw' | 'poll' | 'rest', Timer>()
   const loggedBaseKinds = new Set<'ok' | 'sad'>()
 
   const currentOf = (engine: Host): Host => host ?? engine
@@ -180,6 +187,13 @@ export function register(on: On) {
     polled.headKey = ''
     timers.get('poll')?.cancel()
     timers.delete('poll')
+    timers.get('rest')?.cancel()
+    timers.delete('rest')
+    timedOutRefreshes = 0
+    isRefreshQueued = false
+    isQueuedAsked = false
+    timers.get('refresh')?.cancel()
+    timers.delete('refresh')
   }
 
   function dialogPane(): PaneOpenArgs {
@@ -312,6 +326,10 @@ export function register(on: On) {
           return
         }
 
+        if (isRefreshQueued && !isRefreshing) {
+          void endOverdueRest(engine)
+        }
+
         void readHeadKey().then(key => {
           const hasMoved = polled.headKey !== '' && key !== polled.headKey
 
@@ -325,9 +343,25 @@ export function register(on: On) {
     )
   }
 
-  async function refresh(engine: Host): Promise<void> {
-    if (isRefreshing) {
+  /**
+   * One read of the diff, covering every change seen before it starts. A call
+   * made during a read is kept as one later read. So is a call made during
+   * the wait after a slow read (refreshRestOf), unless `isAsked`.
+   *
+   * @param engine the bound host
+   * @param isAsked skips that wait: true when someone is waiting on this read,
+   *   such as an opening pane
+   */
+  async function refresh(engine: Host, isAsked = false): Promise<void> {
+    const isHeld = isRefreshing || (timers.has('rest') && !isAsked)
+
+    if (isHeld) {
       isRefreshQueued = true
+      isQueuedAsked ||= isAsked
+
+      if (!isRefreshing) {
+        void endOverdueRest(engine)
+      }
 
       return
     }
@@ -340,23 +374,40 @@ export function register(on: On) {
       settle = resolve
     })
 
+    isRefreshQueued = false
+    isQueuedAsked = false
+    timers.get('refresh')?.cancel()
+    timers.delete('refresh')
+
     const record = Record.recorderOf(engine)
     const pinned = backend
+    const { epoch } = pin
+    const startedMs = await engine.now().catch(() => null)
 
-    const fetched = (): Promise<Git.FetchOutcome> =>
-      pinned
-        ? pinned.fetchDiff(model.requestedMode)
-        : Promise.resolve({ kind: 'no-repository' })
+    let readKind: Git.FetchOutcome['kind'] | null = null
+    let fetchedMs: number | null = null
+
+    const fetched = async () => {
+      const outcome: Git.FetchOutcome = pinned
+        ? await pinned.fetchDiff(model.requestedMode)
+        : { kind: 'no-repository' }
+
+      return { outcome, endedMs: await engine.now().catch(() => null) }
+    }
 
     try {
       model = { ...model, isLoading: model.data === null }
 
-      const [outcome, messages] = await Promise.all([
+      const [read, messages] = await Promise.all([
         fetched(),
         engine.messages().catch((): SessionMessage[] => []),
       ])
 
+      const { outcome } = read
+
+      fetchedMs = read.endedMs
       model = PaneState.afterFetch(model, { outcome, messages })
+      readKind = outcome.kind
 
       switch (outcome.kind) {
         case 'no-repository':
@@ -392,27 +443,144 @@ export function register(on: On) {
 
       throw error
     } finally {
+      const endedMs = await engine.now().catch(() => null)
+      const gitEndedMs = fetchedMs ?? endedMs
+
+      const tookMs =
+        startedMs === null || gitEndedMs === null ? 0 : gitEndedMs - startedMs
+
       isRefreshing = false
       settle()
-      redraw(engine)
 
-      if (isRefreshQueued) {
-        isRefreshQueued = false
-        scheduleRefresh(engine)
+      if (epoch === pin.epoch) {
+        rest(engine, tookMs, readKind, endedMs ?? fetchedMs)
       }
+
+      redraw(engine)
+      runQueued(engine)
+    }
+  }
+
+  /**
+   * Starts the wait after a read (refreshRestOf). A failed git run does not say
+   * why, so a read that got nothing counts as timed out once it ran for
+   * GIT_TIMEOUT_MS.
+   *
+   * @param engine the bound host
+   * @param tookMs how long the file listing ran (Backend.fetchDiff, not the
+   *   hunk loads)
+   * @param kind what it read, or null when it threw
+   * @param endedMs when the refresh ended, or null if the clock failed
+   */
+  function rest(
+    engine: Host,
+    tookMs: number,
+    kind: Git.FetchOutcome['kind'] | null,
+    endedMs: number | null,
+  ) {
+    const isTimedOut = kind !== 'data' && tookMs >= Limits.GIT_TIMEOUT_MS
+
+    timedOutRefreshes = isTimedOut ? timedOutRefreshes + 1 : 0
+    timers.get('rest')?.cancel()
+    timers.delete('rest')
+
+    const restMs = refreshRestOf(tookMs, timedOutRefreshes)
+
+    if (restMs === 0) {
+      askKeptOpen(engine)
+
+      return
+    }
+
+    const timer = engine.after(restMs, () => {
+      if (timers.get('rest') === timer) {
+        endRest(engine)
+      }
+    })
+
+    timers.set('rest', timer)
+    restDueMs = endedMs === null ? null : endedMs + restMs
+  }
+
+  function endRest(engine: Host) {
+    timers.delete('rest')
+    runQueued(engine)
+    askKeptOpen(engine)
+  }
+
+  function askKeptOpen(engine: Host) {
+    if (isOpenAskKept) {
+      isOpenAskKept = false
+      void openOnFirstEdit(engine).catch(() => undefined)
+    }
+  }
+
+  /**
+   * Ends a wait whose time has passed but whose timer never fired because the
+   * host refused it, so a refused timer cannot hold reads for the whole
+   * session.
+   *
+   * @param engine the bound host
+   */
+  async function endOverdueRest(engine: Host) {
+    const timer = timers.get('rest')
+    const dueMs = restDueMs
+    const nowMs = await engine.now().catch(() => null)
+
+    const isOverdue =
+      timer !== undefined &&
+      timers.get('rest') === timer &&
+      dueMs !== null &&
+      nowMs !== null &&
+      nowMs >= dueMs
+
+    if (isOverdue) {
+      endRest(engine)
+    }
+  }
+
+  /**
+   * Starts the read kept while a read ran or a wait held it: at once if it
+   * skips the wait, otherwise after the debounce once the wait ends. A read
+   * that does not skip the wait is dropped if the pane has closed.
+   *
+   * @param engine the bound host
+   */
+  function runQueued(engine: Host) {
+    if (!isRefreshQueued || isRefreshing) {
+      return
+    }
+
+    const isAsked = isQueuedAsked
+    const isResting = timers.has('rest')
+
+    if (isResting && !isAsked && isPaneOpen) {
+      return
+    }
+
+    isRefreshQueued = false
+    isQueuedAsked = false
+
+    if (isAsked) {
+      void refresh(engine, true)
+    } else if (isPaneOpen) {
+      scheduleRefresh(engine)
     }
   }
 
   function scheduleRefresh(engine: Host): void {
     timers.get('refresh')?.cancel()
 
-    timers.set(
-      'refresh',
-      engine.after(Limits.REFRESH_DEBOUNCE_MS, () => {
-        timers.delete('refresh')
-        void refresh(engine)
-      }),
-    )
+    const timer = engine.after(Limits.REFRESH_DEBOUNCE_MS, () => {
+      if (timers.get('refresh') !== timer) {
+        return
+      }
+
+      timers.delete('refresh')
+      void refresh(engine)
+    })
+
+    timers.set('refresh', timer)
   }
 
   async function markShown(
@@ -434,7 +602,7 @@ export function register(on: On) {
     await markShown(engine, trigger)
     await pinBackend(engine)
     keepBaseline()
-    void refresh(engine)
+    void refresh(engine, true)
   }
 
   async function openPane(
@@ -476,7 +644,7 @@ export function register(on: On) {
     const generationBefore = generation
 
     if (!isDialog) {
-      await refresh(engine).catch(() => undefined)
+      await refresh(engine, true).catch(() => undefined)
     }
 
     /**
@@ -520,6 +688,10 @@ export function register(on: On) {
     isPaneOpen = true
     keepBaseline()
 
+    if (!isDialog && outcome !== 'awaited') {
+      void engine.registerCommand(DOCKED_COMMAND_SPEC).catch(() => undefined)
+    }
+
     if (outcome === 'awaited') {
       awaited = trigger
     } else {
@@ -529,7 +701,7 @@ export function register(on: On) {
     const isStale = isDialog || landed !== landedBefore
 
     if (isStale) {
-      void refresh(engine)
+      void refresh(engine, true)
     }
 
     return outcome
@@ -554,6 +726,20 @@ export function register(on: On) {
     if (isTaken()) {
       return
     }
+
+    /**
+     * An ask after one that did not open the pane reads the repository again,
+     * so it waits like a read an edit or command causes. Asks made during the
+     * wait become one ask when it ends.
+     */
+    if (isAutoOpenPending && timers.has('rest')) {
+      isOpenAskKept = true
+      void endOverdueRest(engine)
+
+      return
+    }
+
+    isOpenAskKept = false
 
     const closesBefore = personCloses
     const preference = await engine.storeGet(Names.STORE_OPEN_KEY)
@@ -687,7 +873,7 @@ export function register(on: On) {
           .catch(() => undefined)
       }
 
-      void refresh(engine)
+      void refresh(engine, true)
       redraw(engine)
     },
     chooseSource: value => {
@@ -782,9 +968,7 @@ export function register(on: On) {
         startedAt: () =>
           $.session
             .usage()
-            .then((usage: unknown) =>
-              isRecord(usage) ? usage.startedAt : undefined,
-            ),
+            .then(usage => (isRecord(usage) ? usage.startedAt : undefined)),
         mark: entry => $.telemetry.mark(entry),
         log: entry => $.telemetry.log(entry),
       },
@@ -836,17 +1020,23 @@ export function register(on: On) {
     }
 
     /**
+     * The model lays out two seats; a widget, or a seat this build has not
+     * heard of, gets the dock's.
+     */
+    const placement = e.props.placement === 'inline' ? 'inline' : 'dock'
+
+    /**
      * A seat that changed since the last drawing lists other rows, whose
      * bodies are read once.
      *
      * The model takes the new seat in this same pass, so the drawing that
      * read asks for finds the seat unchanged.
      */
-    const isReseated = e.props.placement !== model.placement
+    const isReseated = placement !== model.placement
 
     model = {
       ...model,
-      placement: e.props.placement,
+      placement,
       place: {
         ...model.place,
         columns: Math.max(
@@ -867,9 +1057,14 @@ export function register(on: On) {
         actions: actionsOf(host),
         columns: e.props.bodyColumns,
         rows: e.props.scroll.bodyRows,
+        hasCloseHint:
+          placement === 'dock' &&
+          e.surface === 'terminal' &&
+          !e.props.isFocused &&
+          !e.props.isPromptCovered,
       },
       model,
-      { placement: e.props.placement, terminalColumns: columns },
+      { placement, terminalColumns: columns },
     )
   })
 
@@ -878,19 +1073,43 @@ export function register(on: On) {
       return next(e)
     }
 
-    const isAnswered = (await pinBackend(host)) || (await pinBackend(host))
+    /**
+     * Runs typed during a turn can overlap. One that starts before the last
+     * has finished would toggle from a state about to change, so it is dropped.
+     */
+    if (isToggling) {
+      return {}
+    }
 
-    if (!backend) {
-      return {
-        text: isAnswered
-          ? Names.NOT_IN_REPOSITORY_TEXT
-          : Names.GIT_UNANSWERED_TEXT,
+    isToggling = true
+
+    try {
+      return await togglePane(host, e.presentation)
+    } finally {
+      isToggling = false
+    }
+  })
+
+  async function togglePane(
+    engine: Host,
+    presentation: Args<'command.run'>['presentation'],
+  ): Promise<ResultOf['command.run']> {
+    if (!isPaneOpen) {
+      const isAnswered =
+        (await pinBackend(engine)) || (await pinBackend(engine))
+
+      if (!backend) {
+        return {
+          text: isAnswered
+            ? Names.NOT_IN_REPOSITORY_TEXT
+            : Names.GIT_UNANSWERED_TEXT,
+        }
       }
     }
 
-    const { isFullscreen } = e.presentation
+    const { isFullscreen } = presentation
 
-    columns = e.presentation.columns
+    columns = presentation.columns
     model = { ...model, isFullscreen }
 
     const toggle = PaneToggle.paneToggleOf({
@@ -906,11 +1125,12 @@ export function register(on: On) {
 
     if (!isOpening) {
       personCloses += 1
+      hasAutoOpened = true
     }
 
     const outcome = isOpening
-      ? await openPane(host, 'manual')
-      : await closePane(host).then(() => 'placed' as const)
+      ? await openPane(engine, 'manual')
+      : await closePane(engine).then(() => 'placed' as const)
 
     if (outcome === 'withdrawn') {
       return { text: Names.RESIZE_TERMINAL_TEXT }
@@ -924,13 +1144,16 @@ export function register(on: On) {
       return isOpening ? {} : { text: Names.DIALOG_DISMISSED_TEXT }
     }
 
-    markTabSwitch(host, isOpening ? 'diff' : 'convo')
-    await host.storeSet(Names.STORE_OPEN_KEY, isOpening).catch(() => undefined)
+    markTabSwitch(engine, isOpening ? 'diff' : 'convo')
+
+    await engine
+      .storeSet(Names.STORE_OPEN_KEY, isOpening)
+      .catch(() => undefined)
 
     return {
       text: isOpening ? Names.PANEL_SHOWN_TEXT : Names.PANEL_HIDDEN_TEXT,
     }
-  })
+  }
 
   on('ui.close', { id: Names.PANE_ID }, async ($, e, next) => {
     const isBack =
@@ -962,6 +1185,7 @@ export function register(on: On) {
 
     if (isPersons) {
       personCloses += 1
+      hasAutoOpened = true
     }
 
     const isDocking = model.isFullscreen !== false
@@ -1034,6 +1258,7 @@ export function register(on: On) {
     unpin()
     hasAutoOpened = false
     isAutoOpenPending = false
+    isOpenAskKept = false
     hasRestoredEdits = false
     bodyStamp = null
     bodyBase = null
